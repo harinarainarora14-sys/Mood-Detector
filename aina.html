@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Webcam Mood Detector</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --fg: #e7ebf3;
+      --muted: #9aa4b2;
+      --accent: #7c9cff;
+      --card: #121a33;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial;
+      background: linear-gradient(120deg, var(--bg), #111a32 60%, #0f1430);
+      color: var(--fg);
+      min-height: 100dvh; display: grid; place-items: center; padding: 24px;
+    }
+    .app { width: min(960px, 100%); }
+    .card {
+      background: var(--card); border: 1px solid rgba(255,255,255,.06); border-radius: 20px;
+      padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    @media (min-width: 900px){ .grid{ grid-template-columns: 3fr 2fr; } }
+
+    .stage { position: relative; width: 100%; aspect-ratio: 16/10; border-radius: 16px; overflow: hidden; }
+    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+
+    .panel { display: grid; gap: 12px; align-content: start; }
+    h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
+    .small { color: var(--muted); font-size: 12px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 999px;
+      background: rgba(124,156,255,.12); border: 1px solid rgba(124,156,255,.35);
+      font-weight: 600; letter-spacing: .3px;
+    }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    button, select, input[type="range"] {
+      appearance: none; background: #0c1329; color: var(--fg); border: 1px solid rgba(255,255,255,.08);
+      padding: 10px 14px; border-radius: 12px; font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: rgba(124,156,255,.6); }
+    .kvs { display:grid; gap:6px; }
+    .kv { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; border-radius:10px; background:#0a1125; }
+    .bar { height: 8px; border-radius: 6px; background: #0d1530; overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: linear-gradient(90deg, #8ca6ff, #36d1dc); width: 0%; }
+    footer { text-align:center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card grid">
+      <div class="stage">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="panel">
+        <div>
+          <h1>Webcam Mood Detector</h1>
+          <div class="small">Runs in your browser using <code>face-api.js</code>. No video leaves your device.</div>
+        </div>
+        <div class="row">
+          <button id="startBtn">Start Camera</button>
+          <button id="stopBtn" disabled>Stop</button>
+          <label class="pill" title="Detection model size vs speed">
+            Input Size&nbsp;
+            <select id="inputSize">
+              <option value="160">160</option>
+              <option value="224" selected>224</option>
+              <option value="320">320</option>
+              <option value="384">384</option>
+              <option value="416">416</option>
+              <option value="512">512</option>
+            </select>
+          </label>
+          <label class="pill" title="Confidence threshold for face detection">
+            Threshold&nbsp;<input id="threshold" type="range" min="0.1" max="0.8" step="0.05" value="0.5" />
+            <span id="thVal">0.50</span>
+          </label>
+          <!-- New Mode Option -->
+          <label class="pill">
+            Mode&nbsp;
+            <select id="mode">
+              <option value="realtime" selected>Real-Time</option>
+              <option value="1000">Every 1s</option>
+              <option value="2000">Every 2s</option>
+              <option value="4000">Every 4s</option>
+              <option value="5000">Every 5s</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="pill" id="status">Model: loading…</div>
+        <div class="pill" id="mood">—</div>
+
+        <div class="kvs" id="scores"></div>
+      </div>
+    </div>
+    <footer>Tip: better light → better accuracy. Works best facing the camera.</footer>
+  </div>
+
+  <!-- Face API (maintained fork) -->
+  <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const moodEl = document.getElementById('mood');
+    const scoresEl = document.getElementById('scores');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const inputSizeSel = document.getElementById('inputSize');
+    const thresholdRange = document.getElementById('threshold');
+    const thVal = document.getElementById('thVal');
+    const modeSel = document.getElementById('mode');
+
+    const MODEL_URL = 'https://cdn.jsdelivr.net/gh/vladmandic/face-api/model/';
+
+    let stream = null;
+    let running = false;
+    let rafId = null;
+    let intervalId = null;
+
+    function resizeCanvas() {
+      const { videoWidth: w, videoHeight: h } = video;
+      if (!w || !h) return;
+      canvas.width = w;
+      canvas.height = h;
+    }
+
+    function topExpression(expressions) {
+      let best = { key: 'neutral', val: 0 };
+      for (const [key, val] of Object.entries(expressions)) {
+        if (val > best.val) best = { key, val };
+      }
+      return best;
+    }
+
+    async function loadModels() {
+      statusEl.textContent = 'Model: loading…';
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+      ]);
+      statusEl.textContent = 'Model: ready';
+    }
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        running = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        loop();
+      } catch (err) {
+        statusEl.textContent = 'Camera error: ' + err.message;
+      }
+    }
+
+    function stopCamera() {
+      running = false;
+      if (rafId) cancelAnimationFrame(rafId);
+      if (intervalId) clearInterval(intervalId);
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      moodEl.textContent = '—';
+      scoresEl.innerHTML = '';
+    }
+
+    async function detectFace() {
+      const size = parseInt(inputSizeSel.value, 10);
+      const thr = parseFloat(thresholdRange.value);
+      thVal.textContent = thr.toFixed(2);
+
+      const options = new faceapi.TinyFaceDetectorOptions({ inputSize: size, scoreThreshold: thr });
+      const result = await faceapi
+        .detectSingleFace(video, options)
+        .withFaceExpressions();
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (result) {
+        const dims = faceapi.matchDimensions(canvas, { width: video.videoWidth, height: video.videoHeight });
+        const resized = faceapi.resizeResults(result, dims);
+
+        // Draw box
+        faceapi.draw.drawDetections(canvas, resized);
+
+        // Expressions
+        const { key, val } = topExpression(resized.expressions);
+        moodEl.textContent = `Mood: ${key}  (${(val * 100).toFixed(0)}%)`;
+
+        // Scores list with bars
+        scoresEl.innerHTML = '';
+        Object.entries(resized.expressions)
+          .sort((a,b) => b[1] - a[1])
+          .forEach(([k, v]) => {
+            const row = document.createElement('div');
+            row.className = 'kv';
+            const name = document.createElement('div');
+            name.textContent = k;
+            const valEl = document.createElement('div');
+            valEl.textContent = (v * 100).toFixed(1) + '%';
+            row.appendChild(name);
+            row.appendChild(valEl);
+            scoresEl.appendChild(row);
+
+            const bar = document.createElement('div');
+            bar.className = 'bar';
+            const fill = document.createElement('i');
+            fill.style.width = Math.round(v * 100) + '%';
+            bar.appendChild(fill);
+            scoresEl.appendChild(bar);
+          });
+      } else {
+        moodEl.textContent = 'No face detected';
+      }
+    }
+
+    async function loop() {
+      if (!running) return;
+      const mode = modeSel.value;
+
+      if (mode === 'realtime') {
+        await detectFace();
+        rafId = requestAnimationFrame(loop);
+      } else {
+        const delay = parseInt(mode, 10);
+        intervalId = setInterval(detectFace, delay);
+      }
+    }
+
+    // UI wiring
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    inputSizeSel.addEventListener('change', () => { /* picked up next frame */ });
+    thresholdRange.addEventListener('input', () => { thVal.textContent = parseFloat(thresholdRange.value).toFixed(2); });
+
+    // Load models ASAP
+    loadModels();
+  </script>
+</body>
+</html>
